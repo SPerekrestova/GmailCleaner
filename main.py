@@ -113,6 +113,8 @@ def fetch_emails(service):
     results = service.users().messages().list(userId='me', includeSpamTrash=True).execute()
     messages = results.get('messages', [])
 
+    print(f"Found total {len(messages)} emails in the account")
+
     unsubscribe_emails = []
 
     for message in messages:
@@ -161,6 +163,7 @@ def fetch_emails(service):
                 'unsubscribe_instruction': unsubscribe_instruction
             }
             print(body_)
+            time.sleep(2)
             unsubscribe(body_)
             unsubscribe_emails.append(body_)
 
