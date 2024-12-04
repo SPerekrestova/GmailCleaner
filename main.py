@@ -1,22 +1,26 @@
 import logging
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs, unquote, urlsplit
+import sys
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+from email.message import EmailMessage
 import pickle
 import os.path
 import requests
 import base64
 from bs4 import BeautifulSoup
 import spacy
+from sympy import true
 from transformers import pipeline
 from langdetect import detect
 import re
 
 # Define the API scope
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+SCOPES = ['https://mail.google.com/']
 
 # Define models for different languages
 classificationModels = {
@@ -32,12 +36,16 @@ nlpModels = {
     "ru": spacy.load("ru_core_news_sm")
 }
 
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+
+gmailService = None
+
 def detect_language(text):
     """Detect the language of a given text."""
     try:
         return detect(text)
     except Exception as e:
-        print(f"Error detecting language: {e}")
+        logging.error(f"Error detecting language: {e}")
         return "unknown"
 
 def detect_unsubscribe_intent(decoded_body, email_headers):
@@ -65,7 +73,7 @@ def detect_unsubscribe_intent(decoded_body, email_headers):
 
     # Proceed with NLP-based intent detection
     lang = detect_language(decoded_body)
-    print(f"Detected language: {lang}")
+    logging.debug(f"Detected language: {lang}")
     if lang in pipelines:
         # Tokenize and extract sentences from the email body
         nlp = nlpModels[lang]
@@ -85,40 +93,41 @@ def detect_unsubscribe_intent(decoded_body, email_headers):
             labels = candidate_labels.get(lang, ["unsubscribe", "other"])
             result = classifier(cleaned, candidate_labels=labels)
 
-            print(f"{result}")
             if result['labels'][0] == 'unsubscribe' and result['scores'][0] > 0.8:
-                # Parse the sentence as HTML
-                sentence_soup = BeautifulSoup(cleaned, 'html.parser')
-                for a_tag in sentence_soup.find_all('a', href=True):
-                    unsubscribe_link = a_tag['href']
-                    print(f"Found unsubscribe link in NLP-detected sentence: {unsubscribe_link}")
-                    return unsubscribe_link  # Return the unsubscribe link
-                # Search for URLs in the text
-                link_match = re.search(r'(https?://\S+)', cleaned)
-                if link_match:
-                    unsubscribe_link = link_match.group(0)
-                    print(f"Found unsubscribe link in text: {unsubscribe_link}")
-                    return unsubscribe_link
+                if contains_html(cleaned):
+                    # Parse the sentence as HTML
+                    sentence_soup = BeautifulSoup(cleaned, 'html.parser')
+                    for a_tag in sentence_soup.find_all('a', href=True):
+                        unsubscribe_link = a_tag['href']
+                        logging.debug(f"Found unsubscribe link in NLP-detected sentence: {unsubscribe_link}")
+                        return unsubscribe_link  # Return the unsubscribe link
                 else:
-                    print("Unsubscribe intent detected, but no link found.")
-                    return cleaned  # Return the sentence with the intent
+                    # Search for URLs in the text
+                    link_match = re.search(r'(https?://\S+)', cleaned)
+                    if link_match:
+                        unsubscribe_link = link_match.group(0)
+                        logging.debug(f"Found unsubscribe link in text: {unsubscribe_link}")
+                        return unsubscribe_link
+                    else:
+                        logging.debug("Unsubscribe intent detected, but no link found.")
+                        return cleaned  # Return the sentence with the intent
     else:
-        print(f"No model available for language: {lang}")
+        logging.error(f"No model available for language: {lang}")
 
-    print("No unsubscribe link found.")
+    logging.warning("No unsubscribe link found.")
     return None
 
-def fetch_emails(service):
+def fetch_emails():
     """Fetch emails and use NLP to identify unsubscribe instructions."""
-    results = service.users().messages().list(userId='me', includeSpamTrash=True).execute()
+    results = gmailService.users().messages().list(userId='me', includeSpamTrash=True, maxResults=500).execute()
     messages = results.get('messages', [])
 
-    print(f"Found total {len(messages)} emails in the account")
+    logging.info(f"Found total {len(messages)} emails in the account")
 
-    unsubscribe_emails = []
+    unsubscribed_emails = 0
 
     for message in messages:
-        msg = service.users().messages().get(
+        msg = gmailService.users().messages().get(
             userId='me',
             id=message['id'],
             format='full'
@@ -162,12 +171,12 @@ def fetch_emails(service):
                 'subject': subject,
                 'unsubscribe_instruction': unsubscribe_instruction
             }
-            print(body_)
             time.sleep(2)
-            unsubscribe(body_)
-            unsubscribe_emails.append(body_)
+            logging.debug(body_)
+            if unsubscribe(body_):
+                unsubscribed_emails += 1
 
-    return unsubscribe_emails
+    return unsubscribed_emails
 
 
 def unsubscribe(email):
@@ -191,9 +200,14 @@ def unsubscribe(email):
 
     # Handle 'mailto:' links
     if link.startswith('mailto:'):
-        logging.info(f"Unsubscribe link is a mailto link: {link}")
-        # Implement email sending logic here if desired
-        # Be cautious to avoid spamming or violating email policies
+        logging.debug(f"Unsubscribe link is a mailto link: {link}")
+        try:
+            parsed_link = urlsplit(link)
+            to_email = parsed_link.path.replace('mailto:', '').strip()
+            send_unsubscribe_email(parsed_link, to_email)
+            logging.info(f"Unsubscribe email sent for: {sender}")
+        except Exception as e:
+            logging.error(f"Error sending unsubscribe email for {sender}: {e}")
         return
 
     # Handle HTTP/HTTPS links
@@ -212,7 +226,7 @@ def unsubscribe(email):
                 # Look for forms to submit
                 form = soup.find('form')
                 if form:
-                    logging.info(f"Found form on unsubscribe page for: {sender}")
+                    logging.debug(f"Found form on unsubscribe page for: {sender}")
                     form_action = form.get('action')
                     form_method = form.get('method', 'get').lower()
                     form_inputs = form.find_all(['input', 'select', 'textarea'])
@@ -250,17 +264,19 @@ def unsubscribe(email):
                     # Verify unsubscription
                     if form_response.status_code == 200 and 'unsubscribed' in form_response.text.lower():
                         logging.info(f"Successfully unsubscribed from: {sender}")
+                        return true
                     else:
                         logging.warning(f"Form submitted, but could not verify unsubscription for: {sender}")
                 else:
                     # No form found; check for confirmation message
                     if 'unsubscribed' in response.text.lower():
                         logging.info(f"Successfully unsubscribed from: {sender}")
+                        return true
                     else:
                         logging.warning(f"No form or confirmation message found for: {sender}")
             else:
                 # Non-HTML content
-                logging.info(f"Received non-HTML response when unsubscribing from: {sender}")
+                logging.debug(f"Received non-HTML response when unsubscribing from: {sender}")
         else:
             logging.warning(f"Failed to access unsubscribe link for: {sender} - Status code: {response.status_code}")
 
@@ -289,8 +305,48 @@ def authenticate_gmail():
             pickle.dump(creds, token)
     return build('gmail', 'v1', credentials=creds)
 
+def send_unsubscribe_email(parsed_link, to_email):
+    try:
+        query_params = parse_qs(parsed_link.query)
+
+        # Extract subject and body, handling URL encoding
+        subject = query_params.get('subject', [''])[0]
+        body = query_params.get('body', [''])[0]
+        subject = unquote(subject)
+        body = unquote(body)
+
+        # Construct the email message
+        msg = EmailMessage()
+        msg['From'] = gmailService.users().getProfile(userId='me').execute().get('emailAddress')
+        msg['To'] = to_email
+        msg['Subject'] = subject if subject else 'Unsubscribe Request'
+        msg.set_content(body if body else 'Please unsubscribe me from your mailing list.')
+
+        # encoded message
+        encoded_message = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+
+        create_message = {"raw": encoded_message}
+        # pylint: disable=E1101
+        send_message = (
+            gmailService.users()
+            .messages()
+            .send(userId="me", body=create_message)
+            .execute()
+        )
+
+        logging.debug(f'Message Id: {send_message["id"]}')
+    except HttpError as error:
+        logging.error(f"An error occurred: {error}")
+        send_message = None
+
+    return send_message
+
+def contains_html(text):
+    """Check if the text contains HTML tags."""
+    return bool(re.search(r'<.*?>', text))
+
 # Test the connection by listing Gmail labels
 if __name__ == "__main__":
-    service = authenticate_gmail()
-    emails_with_unsubscribe = fetch_emails(service)
-    print(f"Found {len(emails_with_unsubscribe)} emails with unsubscribe links.")
+    gmailService = authenticate_gmail()
+    successfully_unsubscribed = fetch_emails()
+    logging.info(f"Successfully unsubscribed from {successfully_unsubscribed} junk emails.")
